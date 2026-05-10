@@ -2,208 +2,204 @@ rednet.open("top")
 
 local bridge = peripheral.wrap("right")
 
-if not fs.exists("profile") then
-    local f=fs.open("profile","w")
-    f.write(textutils.serialize({
-        rollPower=1,
-        pitchPower=1,
-        yawPower=1
-    }))
-    f.close()
-end
-
-local f=fs.open("profile","r")
-local profile=textutils.unserialize(f.readAll())
-f.close()
-
 print("WAITING TARGET")
 
-local _,msg=rednet.receive("geran")
+local _,msg = rednet.receive("geran")
 
-local TARGET_X=msg.x
-local TARGET_Y=msg.y
-local TARGET_Z=msg.z
+local TX = msg.x
+local TY = msg.y
+local TZ = msg.z
 
-local CRUISE_MIN=100
-local CRUISE_MAX=150
+local CRUISE_ALT = 125
+local DESCENT_DIST = 120
+local SAFE_BANK = 0.35
+local LOOP = 0.05
 
-local APPROACH_DISTANCE=120
-
-local SAFE_ALTITUDE=70
-
-local LOOP_DELAY=0.05
+local rollState = "none"
+local pitchState = "none"
 
 local function sig(a,b,p)
-    bridge.sendLinkSignal(a,b,p)
+ bridge.sendLinkSignal(a,b,p)
 end
 
-local function clear()
-    sig("minecraft:red_wool","minecraft:netherite_ingot",0)
-    sig("minecraft:white_wool","minecraft:iron_ingot",0)
+local function stopAll()
 
-    sig("minecraft:orange_wool","minecraft:copper_ingot",0)
-    sig("minecraft:lime_wool","minecraft:gold_ingot",0)
+ sig("minecraft:red_wool","minecraft:netherite_ingot",0)
+ sig("minecraft:white_wool","minecraft:iron_ingot",0)
 
-    sig("minecraft:light_blue_wool","minecraft:emerald",0)
+ sig("minecraft:orange_wool","minecraft:copper_ingot",0)
+ sig("minecraft:lime_wool","minecraft:gold_ingot",0)
+
 end
 
-local function pitchUp(v)
-    sig("minecraft:red_wool","minecraft:netherite_ingot",v)
-    sig("minecraft:white_wool","minecraft:iron_ingot",v)
+local function setPitch(state)
+
+ if pitchState == state then
+  return
+ end
+
+ pitchState = state
+
+ sig("minecraft:red_wool","minecraft:netherite_ingot",0)
+ sig("minecraft:white_wool","minecraft:iron_ingot",0)
+
+ sig("minecraft:orange_wool","minecraft:copper_ingot",0)
+ sig("minecraft:lime_wool","minecraft:gold_ingot",0)
+
+ if state == "up" then
+
+  sig("minecraft:red_wool","minecraft:netherite_ingot",15)
+  sig("minecraft:white_wool","minecraft:iron_ingot",15)
+
+ elseif state == "down" then
+
+  sig("minecraft:orange_wool","minecraft:copper_ingot",15)
+  sig("minecraft:lime_wool","minecraft:gold_ingot",15)
+
+ end
+
 end
 
-local function pitchDown(v)
-    sig("minecraft:orange_wool","minecraft:copper_ingot",v)
-    sig("minecraft:lime_wool","minecraft:gold_ingot",v)
+local function setRoll(state)
+
+ if rollState == state then
+  return
+ end
+
+ rollState = state
+
+ sig("minecraft:red_wool","minecraft:netherite_ingot",0)
+ sig("minecraft:white_wool","minecraft:iron_ingot",0)
+
+ sig("minecraft:orange_wool","minecraft:copper_ingot",0)
+ sig("minecraft:lime_wool","minecraft:gold_ingot",0)
+
+ if state == "left" then
+
+  sig("minecraft:orange_wool","minecraft:copper_ingot",15)
+  sig("minecraft:white_wool","minecraft:iron_ingot",15)
+
+ elseif state == "right" then
+
+  sig("minecraft:red_wool","minecraft:netherite_ingot",15)
+  sig("minecraft:lime_wool","minecraft:gold_ingot",15)
+
+ end
+
 end
-
-local function rollLeft(v)
-    sig("minecraft:orange_wool","minecraft:copper_ingot",v)
-    sig("minecraft:white_wool","minecraft:iron_ingot",v)
-end
-
-local function rollRight(v)
-    sig("minecraft:red_wool","minecraft:netherite_ingot",v)
-    sig("minecraft:lime_wool","minecraft:gold_ingot",v)
-end
-
-local function engine(v)
-    sig("minecraft:light_blue_wool","minecraft:emerald",v)
-end
-
-local rollIntegral=0
-local pitchIntegral=0
-
-local lastRoll=0
-local lastPitch=0
-
-engine(15)
-
-sleep(1)
 
 while true do
 
-    local pose=sublevel.getLogicalPose()
+ local pose = sublevel.getLogicalPose()
 
-    local px=pose.position.x
-    local py=pose.position.y
-    local pz=pose.position.z
+ local px = pose.position.x
+ local py = pose.position.y
+ local pz = pose.position.z
 
-    local ox=pose.orientation.v.x
-    local oy=pose.orientation.v.y
-    local oz=pose.orientation.v.z
-    local oa=pose.orientation.a
+ local ox = pose.orientation.v.x
+ local oy = pose.orientation.v.y
 
-    local dx=TARGET_X-px
-    local dy=TARGET_Y-py
-    local dz=TARGET_Z-pz
+ local dx = TX - px
+ local dy = TY - py
+ local dz = TZ - pz
 
-    local dist=math.sqrt(dx*dx+dy*dy+dz*dz)
+ local dist =
+  math.sqrt(dx*dx + dy*dy + dz*dz)
 
-    local flatDist=math.sqrt(dx*dx+dz*dz)
+ local flat =
+  math.sqrt(dx*dx + dz*dz)
 
-    local targetYaw=math.atan2(dz,dx)
+ local targetYaw =
+  math.atan2(dz,dx)
 
-    local currentYaw=oy*2
+ local currentYaw =
+  oy * 2
 
-    local yawError=targetYaw-currentYaw
+ local yawError =
+  targetYaw - currentYaw
 
-    while yawError>math.pi do
-        yawError=yawError-math.pi*2
-    end
+ while yawError > math.pi do
+  yawError = yawError - math.pi*2
+ end
 
-    while yawError<-math.pi do
-        yawError=yawError+math.pi*2
-    end
+ while yawError < -math.pi do
+  yawError = yawError + math.pi*2
+ end
 
-    local targetAlt=125
+ local targetAlt = CRUISE_ALT
 
-    if dist<APPROACH_DISTANCE then
-        targetAlt=TARGET_Y+5
-    end
+ if dist < DESCENT_DIST then
+  targetAlt = TY + 5
+ end
 
-    local altError=targetAlt-py
+ local altError =
+  targetAlt - py
 
-    local desiredRoll=0
+ if dist > DESCENT_DIST then
 
-    if yawError>0.15 then
-        desiredRoll=0.45
-    elseif yawError<-0.15 then
-        desiredRoll=-0.45
-    end
+  if altError > 8 then
+   setPitch("up")
+  elseif altError < -8 then
+   setPitch("down")
+  else
+   setPitch("none")
+  end
 
-    if py<SAFE_ALTITUDE then
-        desiredRoll=desiredRoll*0.3
-    end
+ else
 
-    local rollError=desiredRoll-ox
+  if py > TY + 5 then
+   setPitch("down")
+  else
+   setPitch("none")
+  end
 
-    rollIntegral=rollIntegral+rollError*0.01
-    pitchIntegral=pitchIntegral+altError*0.003
+ end
 
-    if rollIntegral>1 then rollIntegral=1 end
-    if rollIntegral<-1 then rollIntegral=-1 end
+ if py < 70 then
 
-    if pitchIntegral>1 then pitchIntegral=1 end
-    if pitchIntegral<-1 then pitchIntegral=-1 end
+  if ox > SAFE_BANK then
+   setRoll("left")
 
-    local rollControl=
-        rollError*2.4+
-        rollIntegral+
-        (rollError-lastRoll)*1.2
+  elseif ox < -SAFE_BANK then
+   setRoll("right")
 
-    local pitchControl=
-        altError*0.05+
-        pitchIntegral+
-        (altError-lastPitch)*0.03
+  else
+   setRoll("none")
+  end
 
-    lastRoll=rollError
-    lastPitch=altError
+ else
 
-    clear()
+  if yawError > 0.18 then
+   setRoll("right")
 
-    if rollControl>0.08 then
-        rollRight(math.min(15,math.floor(math.abs(rollControl)*15)))
-    elseif rollControl<-0.08 then
-        rollLeft(math.min(15,math.floor(math.abs(rollControl)*15)))
-    end
+  elseif yawError < -0.18 then
+   setRoll("left")
 
-    if dist>APPROACH_DISTANCE then
+  else
+   setRoll("none")
+  end
 
-        if pitchControl>0.1 then
-            pitchUp(math.min(15,math.floor(math.abs(pitchControl)*15)))
-        elseif pitchControl<-0.1 then
-            pitchDown(math.min(15,math.floor(math.abs(pitchControl)*15)))
-        end
+ end
 
-    else
+ term.clear()
+ term.setCursorPos(1,1)
 
-        local diveError=(TARGET_Y-py)
+ print("GERAN")
+ print("")
+ print("DIST "..math.floor(dist))
+ print("ALT "..math.floor(py))
+ print("")
+ print("ROLL "..math.floor(ox*100)/100)
+ print("YAW "..math.floor(yawError*100)/100)
+ print("")
+ print("MODE")
 
-        if diveError<-3 then
-            pitchDown(15)
-        elseif diveError>8 then
-            pitchUp(10)
-        end
+ if dist > DESCENT_DIST then
+  print("CRUISE")
+ else
+  print("DESCENT")
+ end
 
-    end
-
-    term.clear()
-    term.setCursorPos(1,1)
-
-    print("GERAN AUTOPILOT")
-    print("")
-    print("DIST "..math.floor(dist))
-    print("ALT "..math.floor(py))
-    print("")
-    print("ROLL "..math.floor(ox*100)/100)
-    print("YAW "..math.floor(yawError*100)/100)
-    print("")
-    print("TARGET")
-    print(math.floor(TARGET_X))
-    print(math.floor(TARGET_Y))
-    print(math.floor(TARGET_Z))
-
-    sleep(LOOP_DELAY)
+ sleep(LOOP)
 
 end
