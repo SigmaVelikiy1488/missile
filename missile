@@ -1,5 +1,6 @@
 local CFG = {
     protocol = "missile",
+
     profileFile = "cargo_profile.txt",
     telemetryFile = "cargo_telemetry.log",
 
@@ -7,17 +8,20 @@ local CFG = {
     cruiseMaxAlt = 200,
     cruiseAlt = 150,
 
-    launchTicks = 30,
+    launchHoldAlt = 120,
     approachDist = 180,
     finalDist = 45,
-    safeAlt = 70,
     finalOffset = 3,
 
     tick = 0.05,
-    leadTime = 1.25,
 
     yawDead = 0.04,
     pitchDead = 0.03,
+
+    yawGain = 7.0,
+    pitchGain = 8.0,
+    altGain = 0.08,
+    finalDiveGain = 0.16,
 
     cruiseRollLimit = 6,
     approachRollLimit = 10,
@@ -27,19 +31,21 @@ local CFG = {
     approachPitchLimit = 12,
     finalPitchLimit = 15,
 
-    thrLaunch = 13,
+    thrLaunch = 14,
     thrCruise = 8,
     thrTurn = 6,
     thrFinal = 5,
     thrRecovery = 12,
     thrMax = 15,
 
-    yawSmooth = 0.20,
-    pitchSmooth = 0.18,
+    smoothYaw = 0.20,
+    smoothPitch = 0.18,
     velSmooth = 0.12,
 
     recoveryStallTicks = 24,
-    recoveryMinSpeed = 0.12
+    recoveryMinSpeed = 0.12,
+
+    launchTicks = 35
 }
 
 local function clamp(v, a, b)
@@ -66,10 +72,6 @@ local function vec(x, y, z)
     return { x = x, y = y, z = z }
 end
 
-local function vadd(a, b)
-    return { x = a.x + b.x, y = a.y + b.y, z = a.z + b.z }
-end
-
 local function vsub(a, b)
     return { x = a.x - b.x, y = a.y - b.y, z = a.z - b.z }
 end
@@ -80,12 +82,6 @@ end
 
 local function vlen(a)
     return math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
-end
-
-local function vnorm(a)
-    local l = vlen(a)
-    if l == 0 then return { x = 0, y = 0, z = 0 } end
-    return { x = a.x / l, y = a.y / l, z = a.z / l }
 end
 
 local function vdot(a, b)
@@ -352,53 +348,6 @@ local function limitedPitchPower(err, dist, mode)
     return clamp(math.floor(p + 0.5), 0, lim)
 end
 
-local function desiredThrottle(mode, dist, altError, speed, verticalSpeed)
-    local base = profile.thrCruise or CFG.thrCruise
-    if mode == "LAUNCH" then
-        base = profile.thrRecovery or CFG.thrRecovery
-    elseif mode == "APPROACH" then
-        base = profile.thrTurn or CFG.thrTurn
-    elseif mode == "FINAL" then
-        base = profile.thrFinal or CFG.thrFinal
-    elseif mode == "RECOVERY" then
-        base = profile.thrRecovery or CFG.thrRecovery
-    end
-
-    local speedTarget = 0
-    if mode == "LAUNCH" then
-        speedTarget = 3.0
-    elseif mode == "CRUISE" then
-        speedTarget = 2.5
-    elseif mode == "APPROACH" then
-        speedTarget = 2.0
-    elseif mode == "FINAL" then
-        speedTarget = 1.4
-    else
-        speedTarget = 3.2
-    end
-
-    local speedErr = speedTarget - speed
-    local t = base + speedErr * 2.1
-
-    if altError < -15 then
-        t = t + 1
-    elseif altError > 12 then
-        t = t + 1
-    end
-
-    if verticalSpeed < -2.5 then
-        t = t + 1
-    elseif verticalSpeed > 2.5 then
-        t = t - 1
-    end
-
-    if dist < CFG.finalDist then
-        t = math.min(t, profile.thrFinal or CFG.thrFinal)
-    end
-
-    return clamp(math.floor(t + 0.5), 3, CFG.thrMax)
-end
-
 local function render(mode, pose, target, dist, desiredAlt, yawErr, pitchErr, thr, speed, vSpeed)
     term.clear()
     term.setCursorPos(1, 1)
@@ -493,7 +442,7 @@ local function aimLoop(target)
         stateTicks = stateTicks + 1
 
         if state ~= "RECOVERY" then
-            if pos.y < CFG.safeAlt then
+            if pos.y < CFG.cruiseMinAlt - 8 then
                 state = "RECOVERY"
                 stateTicks = 0
             elseif dist < CFG.finalDist then
@@ -504,7 +453,7 @@ local function aimLoop(target)
                 state = "CRUISE"
             end
         else
-            if pos.y > CFG.safeAlt + 12 and speed > CFG.recoveryMinSpeed and dist > 20 then
+            if pos.y > CFG.cruiseMinAlt + 12 and speed > CFG.recoveryMinSpeed and dist > 20 then
                 state = (dist < CFG.finalDist) and "FINAL" or ((dist < CFG.approachDist) and "APPROACH" or "CRUISE")
                 stateTicks = 0
                 stallTicks = 0
@@ -529,33 +478,32 @@ local function aimLoop(target)
         if state == "LAUNCH" then
             thr = profile.thrLaunch or CFG.thrLaunch
             if pos.y < (profile.cruiseAlt or CFG.cruiseAlt) - 8 then
-                local p = clamp(math.floor(4 + (profile.cruiseAlt - pos.y) * 0.05), 2, 6)
+                local p = clamp(math.floor(6 + (profile.cruiseAlt - pos.y) * 0.06), 4, 12)
                 setPitchUp(p)
             else
                 stopPitch()
             end
-            rollLimit = 4
-            pitchLimit = 6
+            stopRoll()
 
         elseif state == "CRUISE" then
+            thr = profile.thrCruise or CFG.thrCruise
             rollLimit = profile.cruiseRollLimit or CFG.cruiseRollLimit
             pitchLimit = profile.cruisePitchLimit or CFG.cruisePitchLimit
-            thr = profile.thrCruise or CFG.thrCruise
 
         elseif state == "APPROACH" then
+            thr = profile.thrTurn or CFG.thrTurn
             rollLimit = profile.approachRollLimit or CFG.approachRollLimit
             pitchLimit = profile.approachPitchLimit or CFG.approachPitchLimit
-            thr = profile.thrTurn or CFG.thrTurn
 
         elseif state == "FINAL" then
+            thr = profile.thrFinal or CFG.thrFinal
             rollLimit = profile.finalRollLimit or CFG.finalRollLimit
             pitchLimit = profile.finalPitchLimit or CFG.finalPitchLimit
-            thr = profile.thrFinal or CFG.thrFinal
 
         elseif state == "RECOVERY" then
+            thr = profile.thrRecovery or CFG.thrRecovery
             rollLimit = 3
             pitchLimit = 10
-            thr = profile.thrRecovery or CFG.thrRecovery
         end
 
         local altError = desiredAlt - pos.y
@@ -629,7 +577,6 @@ local function aimLoop(target)
         setThrottle(clamp(math.floor(thr + 0.5), 3, CFG.thrMax))
 
         tickCounter = tickCounter + 1
-
         if tickCounter % 20 == 0 then
             if lastYaw ~= nil then
                 profile.yawGain = adaptGain(profile.yawGain or 7.0, smoothYaw, lastYaw, rollPower, rollLimit)
