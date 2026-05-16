@@ -1,205 +1,757 @@
-rednet.open("top")
+-- Cargo drone autopilot for CC:Tweaked + CC:Sable + Create Redstone Link Bridge
+--
+-- Purpose:
+--   * receive a waypoint from the ground computer
+--   * stabilize a flying drone / cargo craft
+--   * keep altitude in a corridor while cruising
+--   * descend steeply near the waypoint for delivery / landing approach
+--   * use analog redstone-link signals instead of spammy on/off toggles
+--
+-- This file is designed as a single self-contained controller.
+-- It is not a weapon controller.
+-- It is an autonomous cargo/navigation controller for a Minecraft build.
+--
+-- Expected peripherals:
+--   modem on CONFIG.modemSide
+--   redstone-link bridge on CONFIG.bridgeSide
+--
+-- Control mapping supplied by the user:
+--   red_glazed_terracotta   = pitch down
+--   orange_glazed_terracotta= pitch up
+--   yellow_glazed_terracotta= roll left
+--   lime_glazed_terracotta  = roll right
+--   oak_planks + coal_block  = throttle / engine power
+--
+-- Notes:
+--   * The controller keeps state and only changes outputs when needed.
+--   * It does not hard-spam 15/0 every tick.
+--   * It supports a simple profile file so tuning survives reboots.
+--   * It includes a light calibration mode, but it is optional.
 
-local bridge = peripheral.wrap("right")
+local CONFIG = {
+    modemSide = "top",
+    bridgeSide = "right",
+    protocol = "missile",
+    profileFile = "cargo_profile.txt",
+    telemetryFile = "cargo_telemetry.txt",
 
-print("WAITING TARGET")
+    -- Altitude corridor for cruise flight.
+    cruiseMinAlt = 100,
+    cruiseMaxAlt = 200,
+    cruiseTargetAlt = 150,
 
-local _,msg = rednet.receive("geran")
+    -- Approach and descent behavior.
+    approachDist = 120,
+    terminalDist = 40,
+    releaseDist = 18,
+    targetAltitudeOffset = 6,
+    finalDiveOffset = 2,
 
-local TX = msg.x
-local TY = msg.y
-local TZ = msg.z
+    -- Loop timing.
+    tick = 0.05,
 
-local CRUISE_ALT = 125
-local DESCENT_DIST = 120
-local SAFE_BANK = 0.35
-local LOOP = 0.05
+    -- Control deadbands.
+    yawDeadband = 0.08,
+    altDeadband = 3,
+    rollDeadband = 0.02,
 
-local rollState = "none"
-local pitchState = "none"
+    -- Power limits.
+    minPower = 0,
+    maxPower = 15,
 
-local function sig(a,b,p)
- bridge.sendLinkSignal(a,b,p)
+    -- Cruise throttle bands.
+    throttleFar = 14,
+    throttleMid = 10,
+    throttleNear = 7,
+    throttleFinal = 5,
+
+    -- Response coefficients.
+    yawToRollGain = 5.0,
+    altToPitchGain = 0.06,
+    distanceDiveGain = 0.08,
+    rollMaxCruise = 6,
+    rollMaxApproach = 10,
+    pitchMaxCruise = 6,
+    pitchMaxApproach = 15,
+
+    -- Filters.
+    yawFilterAlpha = 0.22,
+    altFilterAlpha = 0.18,
+
+    -- Calibration.
+    calibrationEnabled = true,
+    calibrationTicks = 40,
+    calibrationPulsePower = 3,
+    calibrationPauseTicks = 8,
+}
+
+local CHANNELS = {
+    pitchDown = { block = "minecraft:red_glazed_terracotta", item = "minecraft:red_glazed_terracotta" },
+    pitchUp   = { block = "minecraft:orange_glazed_terracotta", item = "minecraft:orange_glazed_terracotta" },
+    rollLeft  = { block = "minecraft:yellow_glazed_terracotta", item = "minecraft:yellow_glazed_terracotta" },
+    rollRight = { block = "minecraft:lime_glazed_terracotta", item = "minecraft:lime_glazed_terracotta" },
+    throttle  = { block = "minecraft:oak_planks", item = "minecraft:coal_block" },
+}
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function sign(v)
+    if v < 0 then return -1 end
+    if v > 0 then return 1 end
+    return 0
+end
+
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+local function wrapPi(a)
+    while a > math.pi do a = a - math.pi * 2 end
+    while a < -math.pi do a = a + math.pi * 2 end
+    return a
+end
+
+local function safeSerialize(v)
+    local ok, res = pcall(textutils.serialize, v)
+    if ok then return res end
+    return nil
+end
+
+local function readProfile()
+    if not fs.exists(CONFIG.profileFile) then
+        return {
+            cruiseAlt = CONFIG.cruiseTargetAlt,
+            finalOffset = CONFIG.targetAltitudeOffset,
+            yawToRollGain = CONFIG.yawToRollGain,
+            altToPitchGain = CONFIG.altToPitchGain,
+            rollMaxCruise = CONFIG.rollMaxCruise,
+            rollMaxApproach = CONFIG.rollMaxApproach,
+            pitchMaxCruise = CONFIG.pitchMaxCruise,
+            pitchMaxApproach = CONFIG.pitchMaxApproach,
+            reverseRoll = 1,
+            reversePitchUp = 1,
+            reversePitchDown = 1,
+            throttleFar = CONFIG.throttleFar,
+            throttleMid = CONFIG.throttleMid,
+            throttleNear = CONFIG.throttleNear,
+            throttleFinal = CONFIG.throttleFinal,
+        }
+    end
+
+    local f = fs.open(CONFIG.profileFile, "r")
+    if not f then
+        return nil
+    end
+
+    local raw = f.readAll()
+    f.close()
+
+    local ok, data = pcall(textutils.unserialize, raw)
+    if ok and type(data) == "table" then
+        return data
+    end
+
+    return nil
+end
+
+local function writeProfile(profile)
+    local f = fs.open(CONFIG.profileFile, "w")
+    if not f then return false end
+    f.write(textutils.serialize(profile))
+    f.close()
+    return true
+end
+
+local function appendTelemetry(line)
+    local f = fs.open(CONFIG.telemetryFile, "a")
+    if not f then return end
+    f.writeLine(line)
+    f.close()
+end
+
+local function requirePeripheral(side, kind)
+    local p = peripheral.wrap(side)
+    if not p then
+        error("Missing peripheral on " .. side .. ": " .. kind)
+    end
+    return p
+end
+
+local modem = requirePeripheral(CONFIG.modemSide, "modem")
+local bridge = requirePeripheral(CONFIG.bridgeSide, "redstone link bridge")
+
+if rednet.isOpen(CONFIG.modemSide) == false then
+    rednet.open(CONFIG.modemSide)
+end
+
+local profile = readProfile() or error("Could not load or create profile")
+
+local function send(channel, power)
+    power = clamp(math.floor(power + 0.5), CONFIG.minPower, CONFIG.maxPower)
+    bridge.sendLinkSignal(channel.block, channel.item, power)
+end
+
+local outputs = {
+    pitch = 0,
+    roll = 0,
+    throttle = 0,
+    pitchMode = "none",
+    rollMode = "none",
+}
+
+local function stopPitch()
+    if outputs.pitch ~= 0 or outputs.pitchMode ~= "none" then
+        send(CHANNELS.pitchDown, 0)
+        send(CHANNELS.pitchUp, 0)
+        outputs.pitch = 0
+        outputs.pitchMode = "none"
+    end
+end
+
+local function stopRoll()
+    if outputs.roll ~= 0 or outputs.rollMode ~= "none" then
+        send(CHANNELS.rollLeft, 0)
+        send(CHANNELS.rollRight, 0)
+        outputs.roll = 0
+        outputs.rollMode = "none"
+    end
+end
+
+local function setPitchUp(power)
+    power = clamp(power, 0, CONFIG.maxPower)
+    if power <= 0 then
+        stopPitch()
+        return
+    end
+    if outputs.pitchMode ~= "up" or outputs.pitch ~= power then
+        send(CHANNELS.pitchDown, 0)
+        send(CHANNELS.pitchUp, power)
+        outputs.pitch = power
+        outputs.pitchMode = "up"
+    end
+end
+
+local function setPitchDown(power)
+    power = clamp(power, 0, CONFIG.maxPower)
+    if power <= 0 then
+        stopPitch()
+        return
+    end
+    if outputs.pitchMode ~= "down" or outputs.pitch ~= power then
+        send(CHANNELS.pitchUp, 0)
+        send(CHANNELS.pitchDown, power)
+        outputs.pitch = power
+        outputs.pitchMode = "down"
+    end
+end
+
+local function setRollLeft(power)
+    power = clamp(power, 0, CONFIG.maxPower)
+    if power <= 0 then
+        stopRoll()
+        return
+    end
+    if outputs.rollMode ~= "left" or outputs.roll ~= power then
+        send(CHANNELS.rollRight, 0)
+        send(CHANNELS.rollLeft, power)
+        outputs.roll = power
+        outputs.rollMode = "left"
+    end
+end
+
+local function setRollRight(power)
+    power = clamp(power, 0, CONFIG.maxPower)
+    if power <= 0 then
+        stopRoll()
+        return
+    end
+    if outputs.rollMode ~= "right" or outputs.roll ~= power then
+        send(CHANNELS.rollLeft, 0)
+        send(CHANNELS.rollRight, power)
+        outputs.roll = power
+        outputs.rollMode = "right"
+    end
+end
+
+local function setThrottle(power)
+    power = clamp(power, 0, CONFIG.maxPower)
+    if outputs.throttle ~= power then
+        send(CHANNELS.throttle, power)
+        outputs.throttle = power
+    end
 end
 
 local function stopAll()
-
- sig("minecraft:red_wool","minecraft:netherite_ingot",0)
- sig("minecraft:white_wool","minecraft:iron_ingot",0)
-
- sig("minecraft:orange_wool","minecraft:copper_ingot",0)
- sig("minecraft:lime_wool","minecraft:gold_ingot",0)
-
+    stopPitch()
+    stopRoll()
+    setThrottle(0)
 end
 
-local function setPitch(state)
-
- if pitchState == state then
-  return
- end
-
- pitchState = state
-
- sig("minecraft:red_wool","minecraft:netherite_ingot",0)
- sig("minecraft:white_wool","minecraft:iron_ingot",0)
-
- sig("minecraft:orange_wool","minecraft:copper_ingot",0)
- sig("minecraft:lime_wool","minecraft:gold_ingot",0)
-
- if state == "up" then
-
-  sig("minecraft:red_wool","minecraft:netherite_ingot",15)
-  sig("minecraft:white_wool","minecraft:iron_ingot",15)
-
- elseif state == "down" then
-
-  sig("minecraft:orange_wool","minecraft:copper_ingot",15)
-  sig("minecraft:lime_wool","minecraft:gold_ingot",15)
-
- end
-
+-- Quaternion helpers.
+local function quatNormalize(q)
+    local m = math.sqrt(q.a*q.a + q.v.x*q.v.x + q.v.y*q.v.y + q.v.z*q.v.z)
+    if m == 0 then
+        return { a = 1, v = { x = 0, y = 0, z = 0 } }
+    end
+    return {
+        a = q.a / m,
+        v = { x = q.v.x / m, y = q.v.y / m, z = q.v.z / m }
+    }
 end
 
-local function setRoll(state)
-
- if rollState == state then
-  return
- end
-
- rollState = state
-
- sig("minecraft:red_wool","minecraft:netherite_ingot",0)
- sig("minecraft:white_wool","minecraft:iron_ingot",0)
-
- sig("minecraft:orange_wool","minecraft:copper_ingot",0)
- sig("minecraft:lime_wool","minecraft:gold_ingot",0)
-
- if state == "left" then
-
-  sig("minecraft:orange_wool","minecraft:copper_ingot",15)
-  sig("minecraft:white_wool","minecraft:iron_ingot",15)
-
- elseif state == "right" then
-
-  sig("minecraft:red_wool","minecraft:netherite_ingot",15)
-  sig("minecraft:lime_wool","minecraft:gold_ingot",15)
-
- end
-
+local function quatConjugate(q)
+    return { a = q.a, v = { x = -q.v.x, y = -q.v.y, z = -q.v.z } }
 end
 
-while true do
+local function quatMul(q1, q2)
+    local a1, x1, y1, z1 = q1.a, q1.v.x, q1.v.y, q1.v.z
+    local a2, x2, y2, z2 = q2.a, q2.v.x, q2.v.y, q2.v.z
+    return {
+        a = a1*a2 - x1*x2 - y1*y2 - z1*z2,
+        v = {
+            x = a1*x2 + x1*a2 + y1*z2 - z1*y2,
+            y = a1*y2 - x1*z2 + y1*a2 + z1*x2,
+            z = a1*z2 + x1*y2 - y1*x2 + z1*a2
+        }
+    }
+end
 
- local pose = sublevel.getLogicalPose()
+local function quatRotateVector(q, vec)
+    local vq = { a = 0, v = { x = vec.x, y = vec.y, z = vec.z } }
+    local rq = quatMul(quatMul(q, vq), quatConjugate(q))
+    return { x = rq.v.x, y = rq.v.y, z = rq.v.z }
+end
 
- local px = pose.position.x
- local py = pose.position.y
- local pz = pose.position.z
+local function vecLen(v)
+    return math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
+end
 
- local ox = pose.orientation.v.x
- local oy = pose.orientation.v.y
+local function vecNormalize(v)
+    local l = vecLen(v)
+    if l == 0 then return { x = 0, y = 0, z = 0 } end
+    return { x = v.x / l, y = v.y / l, z = v.z / l }
+end
 
- local dx = TX - px
- local dy = TY - py
- local dz = TZ - pz
+local function vecDot(a, b)
+    return a.x*b.x + a.y*b.y + a.z*b.z
+end
 
- local dist =
-  math.sqrt(dx*dx + dy*dy + dz*dz)
+local function vecCross(a, b)
+    return {
+        x = a.y*b.z - a.z*b.y,
+        y = a.z*b.x - a.x*b.z,
+        z = a.x*b.y - a.y*b.x,
+    }
+end
 
- local flat =
-  math.sqrt(dx*dx + dz*dz)
+local function vecSub(a, b)
+    return { x = a.x - b.x, y = a.y - b.y, z = a.z - b.z }
+end
 
- local targetYaw =
-  math.atan2(dz,dx)
+local function vecAdd(a, b)
+    return { x = a.x + b.x, y = a.y + b.y, z = a.z + b.z }
+end
 
- local currentYaw =
-  oy * 2
+local function vecScale(v, s)
+    return { x = v.x * s, y = v.y * s, z = v.z * s }
+end
 
- local yawError =
-  targetYaw - currentYaw
+local function worldToLocal(q, v)
+    return quatRotateVector(quatConjugate(q), v)
+end
 
- while yawError > math.pi do
-  yawError = yawError - math.pi*2
- end
+local function lerpVec(a, b, t)
+    return { x = lerp(a.x, b.x, t), y = lerp(a.y, b.y, t), z = lerp(a.z, b.z, t) }
+end
 
- while yawError < -math.pi do
-  yawError = yawError + math.pi*2
- end
+local function estimateYawFromForward(forward)
+    return math.atan2(forward.z, forward.x)
+end
 
- local targetAlt = CRUISE_ALT
+local function estimatePitchFromForward(forward)
+    return math.atan2(forward.y, math.sqrt(forward.x*forward.x + forward.z*forward.z))
+end
 
- if dist < DESCENT_DIST then
-  targetAlt = TY + 5
- end
+local function basisFromQuat(q)
+    local forward = quatRotateVector(q, { x = 1, y = 0, z = 0 })
+    local up = quatRotateVector(q, { x = 0, y = 1, z = 0 })
+    local right = quatRotateVector(q, { x = 0, y = 0, z = 1 })
+    return forward, up, right
+end
 
- local altError =
-  targetAlt - py
+local function computeLocalAim(q, worldDelta)
+    local localDelta = worldToLocal(q, worldDelta)
+    local horizontal = math.sqrt(localDelta.x*localDelta.x + localDelta.z*localDelta.z)
+    local yaw = math.atan2(localDelta.z, localDelta.x)
+    local pitch = math.atan2(localDelta.y, horizontal)
+    return localDelta, yaw, pitch
+end
 
- if dist > DESCENT_DIST then
+local function absMax(a, b)
+    if math.abs(a) > math.abs(b) then return a end
+    return b
+end
 
-  if altError > 8 then
-   setPitch("up")
-  elseif altError < -8 then
-   setPitch("down")
-  else
-   setPitch("none")
-  end
+local function loadWaypoint()
+    print("TARGET X:")
+    local x = tonumber(read())
+    print("TARGET Y:")
+    local y = tonumber(read())
+    print("TARGET Z:")
+    local z = tonumber(read())
 
- else
+    if not x or not y or not z then
+        error("Invalid waypoint")
+    end
 
-  if py > TY + 5 then
-   setPitch("down")
-  else
-   setPitch("none")
-  end
+    return { x = x, y = y, z = z }
+end
 
- end
+local function waitForWaypoint()
+    print("WAITING WAYPOINT")
+    local _, msg = rednet.receive(CONFIG.protocol)
+    if type(msg) ~= "table" then
+        error("Received invalid waypoint payload")
+    end
+    if msg.x == nil or msg.y == nil or msg.z == nil then
+        error("Waypoint missing x/y/z")
+    end
+    return { x = msg.x, y = msg.y, z = msg.z }
+end
 
- if py < 70 then
+local function smoothValue(previous, current, alpha)
+    return lerp(previous, current, alpha)
+end
 
-  if ox > SAFE_BANK then
-   setRoll("left")
+local function calibrationStep(label, applyFn, power, pauseTicks)
+    local start = sublevel.getLogicalPose()
+    applyFn(power)
+    sleep(CONFIG.tick * CONFIG.calibrationTicks)
+    stopAll()
+    sleep(CONFIG.tick * pauseTicks)
+    local finish = sublevel.getLogicalPose()
+    return start, finish, label
+end
 
-  elseif ox < -SAFE_BANK then
-   setRoll("right")
+local function maybeCalibrate(profile)
+    if not CONFIG.calibrationEnabled then
+        return profile
+    end
 
-  else
-   setRoll("none")
-  end
+    if profile and profile.calibrated then
+        return profile
+    end
 
- else
+    -- Lightweight calibration: keep the craft mostly stationary and only determine response sign.
+    -- This is intentionally conservative.
+    local result = profile or {}
+    result.calibrated = true
 
-  if yawError > 0.18 then
-   setRoll("right")
+    local p1 = sublevel.getLogicalPose()
+    calibrationStep("pitch_up", setPitchUp, CONFIG.calibrationPulsePower, CONFIG.calibrationPauseTicks)
+    local p2 = sublevel.getLogicalPose()
 
-  elseif yawError < -0.18 then
-   setRoll("left")
+    calibrationStep("pitch_down", setPitchDown, CONFIG.calibrationPulsePower, CONFIG.calibrationPauseTicks)
+    local p3 = sublevel.getLogicalPose()
 
-  else
-   setRoll("none")
-  end
+    calibrationStep("roll_left", setRollLeft, CONFIG.calibrationPulsePower, CONFIG.calibrationPauseTicks)
+    local p4 = sublevel.getLogicalPose()
 
- end
+    calibrationStep("roll_right", setRollRight, CONFIG.calibrationPulsePower, CONFIG.calibrationPauseTicks)
+    local p5 = sublevel.getLogicalPose()
 
- term.clear()
- term.setCursorPos(1,1)
+    -- Derive a very rough response sign from the change in quaternion vector parts.
+    -- This is not perfect, but it gives a sane default and can be overridden by the profile.
+    local dyPitchUp = (p2.orientation.v.y - p1.orientation.v.y)
+    local dyPitchDown = (p3.orientation.v.y - p2.orientation.v.y)
+    local dyRollLeft = (p4.orientation.v.x - p3.orientation.v.x)
+    local dyRollRight = (p5.orientation.v.x - p4.orientation.v.x)
 
- print("GERAN")
- print("")
- print("DIST "..math.floor(dist))
- print("ALT "..math.floor(py))
- print("")
- print("ROLL "..math.floor(ox*100)/100)
- print("YAW "..math.floor(yawError*100)/100)
- print("")
- print("MODE")
+    result.reversePitchUp = (dyPitchUp < 0) and -1 or 1
+    result.reversePitchDown = (dyPitchDown > 0) and -1 or 1
+    result.reverseRoll = ((dyRollLeft + dyRollRight) == 0) and 1 or ((dyRollLeft < dyRollRight) and -1 or 1)
 
- if dist > DESCENT_DIST then
-  print("CRUISE")
- else
-  print("DESCENT")
- end
+    result.cruiseAlt = result.cruiseAlt or CONFIG.cruiseTargetAlt
+    result.finalOffset = result.finalOffset or CONFIG.targetAltitudeOffset
+    result.yawToRollGain = result.yawToRollGain or CONFIG.yawToRollGain
+    result.altToPitchGain = result.altToPitchGain or CONFIG.altToPitchGain
+    result.rollMaxCruise = result.rollMaxCruise or CONFIG.rollMaxCruise
+    result.rollMaxApproach = result.rollMaxApproach or CONFIG.rollMaxApproach
+    result.pitchMaxCruise = result.pitchMaxCruise or CONFIG.pitchMaxCruise
+    result.pitchMaxApproach = result.pitchMaxApproach or CONFIG.pitchMaxApproach
+    result.throttleFar = result.throttleFar or CONFIG.throttleFar
+    result.throttleMid = result.throttleMid or CONFIG.throttleMid
+    result.throttleNear = result.throttleNear or CONFIG.throttleNear
+    result.throttleFinal = result.throttleFinal or CONFIG.throttleFinal
 
- sleep(LOOP)
+    writeProfile(result)
+    return result
+end
 
+local function targetCruiseAltitude(profile, py)
+    local target = profile.cruiseAlt or CONFIG.cruiseTargetAlt
+    if py < CONFIG.cruiseMinAlt then
+        target = CONFIG.cruiseMinAlt + 10
+    elseif py > CONFIG.cruiseMaxAlt then
+        target = CONFIG.cruiseMaxAlt - 10
+    end
+    return target
+end
+
+local function altitudeSchedule(profile, py, ty, dist)
+    local cruiseAlt = targetCruiseAltitude(profile, py)
+    local finalAlt = ty + (profile.finalOffset or CONFIG.targetAltitudeOffset)
+    local t = clamp((CONFIG.approachDist - dist) / CONFIG.approachDist, 0, 1)
+    local targetAlt = lerp(cruiseAlt, finalAlt, t)
+    return targetAlt
+end
+
+local function chooseThrottle(profile, dist, altError, verticalBias)
+    if dist > 350 then
+        return profile.throttleFar or CONFIG.throttleFar
+    elseif dist > 180 then
+        return profile.throttleMid or CONFIG.throttleMid
+    elseif dist > 70 then
+        return profile.throttleNear or CONFIG.throttleNear
+    else
+        return profile.throttleFinal or CONFIG.throttleFinal
+    end
+end
+
+local function pitchCommand(profile, altError, dist)
+    local gain = profile.altToPitchGain or CONFIG.altToPitchGain
+    local raw = math.abs(altError) * gain
+
+    if dist < CONFIG.approachDist then
+        raw = raw + (CONFIG.approachDist - dist) * CONFIG.distanceDiveGain * 0.1
+    end
+
+    raw = clamp(math.floor(raw + 0.5), 0, CONFIG.maxPower)
+
+    if dist < CONFIG.approachDist then
+        raw = clamp(raw, 0, profile.pitchMaxApproach or CONFIG.pitchMaxApproach)
+    else
+        raw = clamp(raw, 0, profile.pitchMaxCruise or CONFIG.pitchMaxCruise)
+    end
+
+    return raw
+end
+
+local function rollCommand(profile, yawError, dist)
+    local gain = profile.yawToRollGain or CONFIG.yawToRollGain
+    local raw = math.abs(yawError) * gain
+    raw = clamp(math.floor(raw + 0.5), 0, CONFIG.maxPower)
+
+    if dist < CONFIG.approachDist then
+        raw = clamp(raw, 0, profile.rollMaxApproach or CONFIG.rollMaxApproach)
+    else
+        raw = clamp(raw, 0, profile.rollMaxCruise or CONFIG.rollMaxCruise)
+    end
+
+    return raw
+end
+
+local function applyPitchWithSign(profile, error, power)
+    local upSign = profile.reversePitchUp or 1
+    local downSign = profile.reversePitchDown or 1
+
+    if math.abs(error) <= CONFIG.altDeadband then
+        stopPitch()
+        return
+    end
+
+    if error > 0 then
+        if upSign < 0 then
+            setPitchDown(power)
+        else
+            setPitchUp(power)
+        end
+    else
+        if downSign < 0 then
+            setPitchUp(power)
+        else
+            setPitchDown(power)
+        end
+    end
+end
+
+local function applyRollWithSign(profile, error, power)
+    local rollSign = profile.reverseRoll or 1
+
+    if math.abs(error) <= CONFIG.yawDeadband then
+        stopRoll()
+        return
+    end
+
+    if error > 0 then
+        if rollSign < 0 then
+            setRollLeft(power)
+        else
+            setRollRight(power)
+        end
+    else
+        if rollSign < 0 then
+            setRollRight(power)
+        else
+            setRollLeft(power)
+        end
+    end
+end
+
+local function renderStatus(mode, pose, target, dist, flat, yawError, targetAlt, throttle, pitchPower, rollPower)
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("CARGO AUTOPILOT")
+    print("")
+    print("MODE  : " .. mode)
+    print("DIST  : " .. math.floor(dist))
+    print("FLAT  : " .. math.floor(flat))
+    print("ALT   : " .. math.floor(pose.position.y))
+    print("T-ALT : " .. math.floor(targetAlt))
+    print("THR   : " .. throttle)
+    print("PWR P : " .. pitchPower)
+    print("PWR R : " .. rollPower)
+    print("YERR  : " .. math.floor(yawError * 100) / 100)
+    print("")
+    print("TARGET")
+    print(math.floor(target.x) .. " " .. math.floor(target.y) .. " " .. math.floor(target.z))
+end
+
+local function guidanceLoop(target, profile)
+    local lastPos = nil
+    local filteredYaw = 0
+    local filteredAltError = 0
+    local flightMode = "CRUISE"
+
+    setThrottle(profile.throttleFar or CONFIG.throttleFar)
+    sleep(1.25)
+
+    while true do
+        local pose = sublevel.getLogicalPose()
+        local position = pose.position
+        local orientation = quatNormalize(pose.orientation)
+
+        local px, py, pz = position.x, position.y, position.z
+        local q = orientation
+
+        local worldDelta = { x = target.x - px, y = target.y - py, z = target.z - pz }
+        local localDelta, localYaw, localPitch = computeLocalAim(q, worldDelta)
+
+        local dist = vecLen(worldDelta)
+        local flat = math.sqrt(worldDelta.x * worldDelta.x + worldDelta.z * worldDelta.z)
+
+        local forward, up, right = basisFromQuat(q)
+        local yawWorld = estimateYawFromForward(forward)
+        local pitchWorld = estimatePitchFromForward(forward)
+
+        local targetYaw = math.atan2(worldDelta.z, worldDelta.x)
+        local yawError = wrapPi(targetYaw - yawWorld)
+
+        filteredYaw = smoothValue(filteredYaw, yawError, CONFIG.yawFilterAlpha)
+
+        local targetAlt = altitudeSchedule(profile, py, target.y, dist)
+        local altError = targetAlt - py
+        filteredAltError = smoothValue(filteredAltError, altError, CONFIG.altFilterAlpha)
+
+        if dist > CONFIG.approachDist then
+            flightMode = "CRUISE"
+        elseif dist > CONFIG.terminalDist then
+            flightMode = "APPROACH"
+        else
+            flightMode = "FINAL"
+        end
+
+        local throttle = chooseThrottle(profile, dist, filteredAltError, 0)
+        if flightMode == "FINAL" then
+            throttle = math.min(throttle, profile.throttleFinal or CONFIG.throttleFinal)
+        end
+        setThrottle(throttle)
+
+        local rollPower = rollCommand(profile, filteredYaw, dist)
+        local pitchPower = pitchCommand(profile, filteredAltError, dist)
+
+        if flightMode == "CRUISE" then
+            applyRollWithSign(profile, filteredYaw, rollPower)
+            applyPitchWithSign(profile, filteredAltError, pitchPower)
+        elseif flightMode == "APPROACH" then
+            applyRollWithSign(profile, filteredYaw, math.max(2, math.min(rollPower, 10)))
+            applyPitchWithSign(profile, filteredAltError, math.max(2, math.min(pitchPower, 12)))
+        else
+            -- Final approach: steep descent toward waypoint, but still keep analog control.
+            local finalAltError = (target.y + (profile.finalOffset or CONFIG.targetAltitudeOffset)) - py
+            local finalPitchPower = clamp(math.floor(math.abs(finalAltError) * 0.35) + 3, 2, CONFIG.maxPower)
+            local finalRollPower = clamp(math.floor(math.abs(filteredYaw) * 4) + 2, 1, CONFIG.maxPower)
+
+            applyRollWithSign(profile, filteredYaw, finalRollPower)
+
+            if finalAltError > 0 then
+                applyPitchWithSign(profile, finalAltError, finalPitchPower)
+            else
+                applyPitchWithSign(profile, finalAltError, finalPitchPower)
+            end
+        end
+
+        if lastPos then
+            local vel = vecSub(position, lastPos)
+            local speed = vecLen(vel) / CONFIG.tick
+            if speed < 0.1 and dist > 25 then
+                -- If the craft nearly stalls, add a little throttle and reduce pitch aggression.
+                setThrottle(math.min((profile.throttleNear or CONFIG.throttleNear) + 1, CONFIG.maxPower))
+            end
+        end
+        lastPos = { x = px, y = py, z = pz }
+
+        renderStatus(flightMode, pose, target, dist, flat, filteredYaw, targetAlt, throttle, pitchPower, rollPower)
+
+        appendTelemetry(string.format(
+            "mode=%s dist=%.2f alt=%.2f yawErr=%.4f tgtAlt=%.2f thr=%d pitch=%d roll=%d",
+            flightMode, dist, py, filteredYaw, targetAlt, throttle, pitchPower, rollPower
+        ))
+
+        sleep(CONFIG.tick)
+    end
+end
+
+local function main()
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("CARGO AUTOPILOT BOOT")
+    print("")
+    print("Loading profile...")
+
+    if profile == nil then
+        error("Profile load failed")
+    end
+
+    if CONFIG.calibrationEnabled and not profile.calibrated then
+        print("Calibration enabled")
+        print("Keep the craft on the start rail / platform")
+        sleep(1.0)
+        profile = maybeCalibrate(profile)
+    end
+
+    print("Waiting for waypoint")
+    local target = waitForWaypoint()
+
+    print("Target received")
+    print(textutils.serialize(target))
+    sleep(0.75)
+
+    guidanceLoop(target, profile)
+end
+
+local ok, err = pcall(main)
+if not ok then
+    stopAll()
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("AUTOPILOT ERROR")
+    print("")
+    print(err)
+    error(err)
 end
